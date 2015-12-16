@@ -264,6 +264,17 @@ matrix *matrix_load_block_with_memory(char *filename, long long i_index, long lo
     return m;
 }
 
+matrix *matrix_new_with_memory(long long row_count, long long column_count, void *memory)
+{
+    matrix *m = matrix_new_without_vector_init(row_count, column_count);
+    for (long long i = 0; i < row_count; ++i) {
+        vector *row = vector_new_with_memory(column_count, memory);
+        m->rows[i] = row;
+        memory = ((double *) memory) + row->size;
+    }
+    return m;
+}
+
 void matrix_save_block(matrix *block, char *filename, long long i_index, long long j_index, long long row_count, long long column_count)
 {
     if (j_index == 0 && i_index == 0) {
@@ -684,4 +695,105 @@ void mpi_cannon_multiply_and_save_matrix(char *A_matrixname, char *B_matrixname,
     matrix_delete(C_part);
 
     //profile(r, start, "delete");
+}
+
+void setup_grid(grid_info *grid) { 
+    //determine grid_one_dim
+    int size; 
+    MPI_Comm_size(MPI_COMM_WORLD, &size); 
+    double floorsqrtpart = 0;
+    if (modf(sqrt(size), &floorsqrtpart)) { //should be integer
+        printf("Wrong processor count - non integer square root!\n");
+        exit(0);
+    }
+    int intsqrtpart = floorsqrtpart;
+    grid->grid_one_dim  = intsqrtpart;
+
+    //create cart
+    MPI_Comm cart_comm;
+    int dimensions[2], periods[2];
+    dimensions[0] = dimensions[1] = grid->grid_one_dim; 
+    periods[0] = periods[1] = 1;  
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dimensions, periods, 1, &cart_comm);
+
+    //determine coordinates
+    int myrank;
+    MPI_Comm_rank(cart_comm, &myrank);
+    int coordinates[2];
+    MPI_Cart_coords(cart_comm, myrank, 2, coordinates); 
+    grid->my_row = coordinates[0]; 
+    grid->my_col = coordinates[1]; 
+    
+    //create row and col comms
+    int varying_coords[2];
+    varying_coords[0] = 0; 
+    varying_coords[1] = 1; 
+    MPI_Cart_sub(cart_comm, varying_coords, &(grid->row_comm)); 
+    varying_coords[0] = 1; 
+    varying_coords[1] = 0; 
+    MPI_Cart_sub(cart_comm, varying_coords, &(grid->col_comm));
+
+    //determine up and down ranks
+    MPI_Cart_shift(grid->col_comm, 0, -1, &(grid->downrank), &(grid->uprank));
+}
+
+void mpi_fox_multiply_and_save_matrix(char *A_matrixname, char *B_matrixname, char *resultname)
+{
+    //checks and comms
+    long long A_row_count, A_column_count, B_row_count, B_column_count;
+    matrix_get_size(A_matrixname, &A_row_count, &A_column_count);
+    matrix_get_size(B_matrixname, &B_row_count, &B_column_count);
+
+    if (A_column_count != B_row_count) {
+        printf("Inconsistent column and row counts!\n");
+        exit(0);
+    }
+    
+    grid_info info;
+    setup_grid(&info);
+
+    if (A_row_count % info.grid_one_dim != 0 || A_column_count % info.grid_one_dim != 0 || 
+        B_column_count % info.grid_one_dim != 0 || B_row_count % info.grid_one_dim != 0) {
+        printf("Wrong processor count - different size blocks!\n");
+        exit(0);
+    }
+   
+    //inits
+    long long A_part_row_count = count_part(info.my_row, info.grid_one_dim, A_row_count);
+    long long A_part_column_count = count_part(info.my_col, info.grid_one_dim, A_column_count);
+    long long B_part_row_count = count_part(info.my_row, info.grid_one_dim, B_row_count);
+    long long B_part_column_count = count_part(info.my_col, info.grid_one_dim, B_column_count);
+    long long A_part_size = A_part_row_count * A_part_column_count;
+    void *A_memory = calloc(A_part_size, sizeof(double));
+    long long B_part_size = B_part_row_count * B_part_column_count;
+    void *B_memory = calloc(B_part_size, sizeof(double));
+    matrix *A_part = matrix_load_block_with_memory(A_matrixname, info.my_row, info.my_col, info.grid_one_dim, info.grid_one_dim, A_memory);
+    matrix *B_part = matrix_load_block_with_memory(B_matrixname, info.my_row, info.my_col, info.grid_one_dim, info.grid_one_dim, B_memory);
+    void *other_A_memory = calloc(A_part_size, sizeof(double));
+    matrix *other_A_part = matrix_new_with_memory(A_part_row_count, A_part_column_count, other_A_memory);
+
+    //Computation
+    matrix *C_part = matrix_new(A_part_row_count, B_part_column_count);
+    for (int i = 0; i < info.grid_one_dim; ++i) {
+        int broadcaster_col = (info.my_row + i) % info.grid_one_dim;
+        int root;
+        MPI_Cart_rank(info.row_comm, &broadcaster_col, &root);
+        if (info.my_col == broadcaster_col) { //broadcast my part of A
+            MPI_Bcast(A_memory, A_part_size, MPI_DOUBLE, root, info.row_comm);
+            multiply_matrix_with_addition(A_part, B_part, C_part);
+        } else { //get part of A
+            MPI_Bcast(other_A_memory, A_part_size, MPI_DOUBLE, root, info.row_comm);
+            multiply_matrix_with_addition(other_A_part, B_part, C_part);
+        }
+        //shift matrix B up by one
+        MPI_Status s;
+        MPI_Sendrecv_replace(B_memory, B_part_size, MPI_DOUBLE, info.uprank, 0, info.downrank, 0, info.col_comm, &s);
+    }
+
+    matrix_save_block(C_part, resultname, info.my_row, info.my_col, A_row_count, B_column_count);
+    
+    matrix_delete_with_memory(A_part, A_memory);
+    matrix_delete_with_memory(B_part, B_memory);
+    matrix_delete(C_part);
+    matrix_delete_with_memory(other_A_part, other_A_memory);
 }

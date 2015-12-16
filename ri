@@ -8,5 +8,5 @@ else
     t=00:15:00
 fi
 
-make && mpisubmit.bg -n $1 --wtime $t --stdout out$2_$3_$1.txt main -- $2 $3 $1
+make && mpisubmit.bg -n $1 --wtime $t --stdout out$2_$3_$1.txt main -- $2 $3 $1 --cannon
 

@@ -59,5 +59,17 @@ void sleep(int sec);
 void mpi_cannon_multiply_and_save_matrix(char *A_matrixname, char *B_matrixname, char *resultname);
 void multiply_matrix_with_addition(matrix *A, matrix *B, matrix *C);
 
+typedef struct { 
+    int grid_one_dim; 
+    int my_row;
+    int my_col;
+    MPI_Comm row_comm;
+    MPI_Comm col_comm;
+    int uprank;
+    int downrank;
+} grid_info;
+void setup_grid(grid_info *grid); 
+void mpi_fox_multiply_and_save_matrix(char *A_matrixname, char *B_matrixname, char *resultname);
+
 #endif
 
